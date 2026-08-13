@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 import json
 import base64
@@ -76,6 +76,64 @@ def parse_sse(text):
     return content.strip()
 
 
+def stream_sse_response(session, chat_session_id, prompt, pow_b64):
+    """Generator function to stream SSE responses"""
+    try:
+        with session.post('https://chat.deepseek.com/api/v0/chat/completion',
+            json={
+                "chat_session_id": chat_session_id,
+                "parent_message_id": None,
+                "model_type": None,
+                "prompt": prompt,
+                "ref_file_ids": [],
+                "thinking_enabled": False,
+                "search_enabled": False,
+                "action": None,
+                "preempt": False
+            },
+            headers={'x-ds-pow-response': pow_b64},
+            timeout=60,
+            stream=True) as response:
+            
+            for line in response.iter_lines(decode_unicode=True):
+                if line and line.startswith('data: '):
+                    try:
+                        data = json.loads(line[6:])
+                        v = data.get('v')
+                        p = data.get('p', '')
+                        o = data.get('o', '')
+                        
+                        # Extract content chunks
+                        content_chunk = None
+                        if isinstance(v, str) and v not in ['FINISHED', 'WIP', '']:
+                            if p == 'response/fragments/-1/content' or o == 'APPEND':
+                                content_chunk = v
+                            elif p == '' and o == '':
+                                content_chunk = v
+                        elif isinstance(v, dict) and 'response' in v:
+                            frags = v['response'].get('fragments', [])
+                            for f in frags:
+                                c = f.get('content', '')
+                                if c:
+                                    content_chunk = c
+                                    break
+                        
+                        if content_chunk:
+                            # Send as SSE format
+                            yield f"data: {json.dumps({'chunk': content_chunk})}\n\n"
+                        
+                        # Check for completion
+                        if isinstance(v, str) and v == 'FINISHED':
+                            yield f"data: {json.dumps({'done': True})}\n\n"
+                            break
+                            
+                    except (json.JSONDecodeError, KeyError) as e:
+                        continue
+                        
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
 @app.route('/api/chat', methods=['GET'])
 def chat():
     prompt = request.args.get('prompt')
@@ -123,6 +181,55 @@ def chat():
 
     except Exception as e:
         return jsonify({'success': False, 'developer': DEV_NAME, 'message': str(e)})
+
+
+@app.route('/stream', methods=['GET'])
+def stream_chat():
+    """Streaming endpoint that returns chunks as Server-Sent Events"""
+    prompt = request.args.get('prompt')
+
+    if not prompt:
+        return jsonify({'success': False, 'developer': DEV_NAME, 'message': 'prompt required'})
+
+    def generate():
+        try:
+            s = requests.Session()
+            s.headers.update(HEADERS)
+
+            # Create chat session
+            session_resp = s.post('https://chat.deepseek.com/api/v0/chat_session/create', timeout=15)
+            chat_session_id = session_resp.json()['data']['biz_data']['chat_session']['id']
+
+            # Get POW challenge
+            pow_resp = s.post('https://chat.deepseek.com/api/v0/chat/create_pow_challenge',
+                json={"target_path": "/api/v0/chat/completion"}, timeout=15)
+            cd = pow_resp.json()['data']['biz_data']['challenge']
+
+            pow_b64 = solve_pow(cd)
+
+            # Send initial message
+            yield f"data: {json.dumps({'status': 'connected'})}\n\n"
+
+            # Stream the response
+            for chunk in stream_sse_response(s, chat_session_id, prompt, pow_b64):
+                yield chunk
+
+            # Clean up
+            try:
+                s.post('https://chat.deepseek.com/api/v0/chat_session/delete',
+                    json={"chat_session_id": chat_session_id}, timeout=10)
+            except Exception:
+                pass
+
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return Response(stream_with_context(generate()), 
+                   mimetype='text/event-stream',
+                   headers={
+                       'Cache-Control': 'no-cache',
+                       'X-Accel-Buffering': 'no'
+                   })
 
 
 if __name__ == '__main__':
